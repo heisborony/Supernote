@@ -24,6 +24,12 @@
       --text-muted:  #7A7060;
       --text-dim:    #46422E;
       --red:         #C0392B;
+      --sel-color:   #3DFFC3;
+      --sel-dim:     rgba(61,255,195,0.10);
+      --sel-glow:    rgba(61,255,195,0.22);
+      --chr-color:   #B57BFF;
+      --chr-dim:     rgba(181,123,255,0.10);
+      --chr-glow:    rgba(181,123,255,0.22);
     }
 
     html, body {
@@ -307,7 +313,7 @@
     .btn-empty-cta:hover { background: var(--gold); color: var(--bg); }
 
     /* ─── EDITOR AREA ─── */
-    .editor-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    .editor-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; max-width: 100%; }
 
     /* ─── TOOLBAR ─── */
     .toolbar {
@@ -320,7 +326,10 @@
       background: var(--surface);
       overflow-x: auto;
       white-space: nowrap;
+      scrollbar-width: none; /* Firefox: scroll still works, track just doesn't render */
+      -ms-overflow-style: none;
     }
+    .toolbar::-webkit-scrollbar { display: none; } /* Chrome/Safari/Edge: same */
 
     .tb-btn {
       background: transparent;
@@ -348,10 +357,14 @@
     .tb-spacer { flex: 1; }
 
     /* ─── EDITOR CONTENT ─── */
-    .editor-scroll { flex: 1; overflow-y: auto; }
+    /* overflow-x: hidden (not the default `visible`) stops the contenteditable from ever
+       leaking a horizontal scrollbar during flex reflow — it was only ever clipping
+       vertically before, so transient width overshoots during resize showed through. */
+    .editor-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; min-width: 0; }
 
     #editor-content {
       min-height: 100%;
+      max-width: 100%;
       outline: none;
       font-family: 'Inter', sans-serif;
       font-size: 15px;
@@ -359,6 +372,8 @@
       color: var(--text);
       caret-color: var(--gold);
       padding: 32px 44px;
+      overflow-wrap: anywhere; /* long unbroken strings (URLs, etc.) wrap instead of pushing width out */
+      word-break: break-word;
     }
 
     #editor-content.placeholder-show::before {
@@ -427,6 +442,42 @@
       100% { transform: scale(1); }
     }
     .stat-num.bump { animation: statBump 0.2s ease-out; }
+
+    /* ─── SELECTION STATS (Selected Words / Selected Chars) ─── */
+    .stat-sep {
+      width: 1px;
+      height: 22px;
+      background: var(--border-sub);
+      flex-shrink: 0;
+    }
+
+    .sel-pill .stat-num-sel { color: var(--text-dim); transition: color 0.15s; }
+    .chr-pill .stat-num-chr { color: var(--text-dim); transition: color 0.15s; }
+
+    .sel-pill.active .stat-num-sel { color: var(--sel-color); }
+    .chr-pill.active .stat-num-chr { color: var(--chr-color); }
+
+    .sel-pill.active .stat-lbl { color: var(--sel-color); opacity: 0.75; }
+    .chr-pill.active .stat-lbl { color: var(--chr-color); opacity: 0.75; }
+
+    @keyframes selPulse {
+      0%   { box-shadow: 0 0 0 0 var(--sel-glow); }
+      70%  { box-shadow: 0 0 0 7px transparent; }
+      100% { box-shadow: 0 0 0 0 transparent; }
+    }
+    @keyframes chrPulse {
+      0%   { box-shadow: 0 0 0 0 var(--chr-glow); }
+      70%  { box-shadow: 0 0 0 7px transparent; }
+      100% { box-shadow: 0 0 0 0 transparent; }
+    }
+    .sel-pill.active { animation: selPulse 0.45s ease-out; border-radius: 4px; }
+    .chr-pill.active { animation: chrPulse 0.45s ease-out; border-radius: 4px; }
+
+    /* On mobile, the two count labels get long ("highlight to count") — let them wrap as a pair, not force overflow */
+    @media (max-width: 480px) {
+      .stat-sep { display: none; }
+      .sel-pill, .chr-pill { min-width: 0; }
+    }
 
     /* ══════════════════════ MODALS ══════════════════════ */
     .modal {
@@ -654,6 +705,15 @@
             <div class="stat-pill">
               <span class="stat-num" id="stat-paragraphs">0</span>
               <span class="stat-lbl">Paragraphs</span>
+            </div>
+            <span class="stat-sep"></span>
+            <div class="stat-pill sel-pill" id="sel-words-pill">
+              <span class="stat-num stat-num-sel" id="stat-sel-words">—</span>
+              <span class="stat-lbl" id="stat-sel-words-lbl">highlight to count</span>
+            </div>
+            <div class="stat-pill chr-pill" id="sel-chars-pill">
+              <span class="stat-num stat-num-chr" id="stat-sel-chars">—</span>
+              <span class="stat-lbl" id="stat-sel-chars-lbl">highlight to count</span>
             </div>
           </div>
         </div>
@@ -1022,6 +1082,82 @@ function updateStats() {
   bumpIfChanged(document.getElementById('stat-sentences'),  'sentences',  countSentences(text));
   bumpIfChanged(document.getElementById('stat-paragraphs'), 'paragraphs', countParagraphs(text));
 }
+
+// ──────────────────────────────── SELECTION STATS ──────────────────────
+// Mirrors the original word.count app's "Selected Words / Selected Chars" cards,
+// adapted from textarea.selectionStart/End to a contenteditable Range/Selection.
+const selWordsEl  = document.getElementById('stat-sel-words');
+const selCharsEl  = document.getElementById('stat-sel-chars');
+const selWordsLbl = document.getElementById('stat-sel-words-lbl');
+const selCharsLbl = document.getElementById('stat-sel-chars-lbl');
+const selWordsPill = document.getElementById('sel-words-pill');
+const selCharsPill = document.getElementById('sel-chars-pill');
+
+let lastSelWords = -1;
+let lastSelChars = -1;
+
+function resetSelectionStats() {
+  if (lastSelWords === 0 && lastSelChars === 0) return; // already idle, skip redundant DOM writes
+  selWordsEl.textContent = '—';
+  selCharsEl.textContent = '—';
+  selWordsLbl.textContent = 'highlight to count';
+  selCharsLbl.textContent = 'highlight to count';
+  selWordsPill.classList.remove('active');
+  selCharsPill.classList.remove('active');
+  lastSelWords = 0;
+  lastSelChars = 0;
+}
+
+function updateSelectionStats() {
+  // Only track selection while the user is actually working inside the editor
+  if (document.activeElement !== editorContent && !editorContent.contains(document.activeElement)) {
+    return;
+  }
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+    resetSelectionStats();
+    return;
+  }
+  const range = sel.getRangeAt(0);
+  // Selection must actually be inside the editor (not, say, the toolbar or a modal)
+  if (!editorContent.contains(range.commonAncestorContainer)) {
+    resetSelectionStats();
+    return;
+  }
+
+  const selectedText = range.toString();
+  if (!selectedText) {
+    resetSelectionStats();
+    return;
+  }
+
+  const wc = countWords(selectedText);
+  const cc = selectedText.length;
+
+  if (wc !== lastSelWords) {
+    selWordsEl.textContent = wc;
+    selWordsLbl.textContent = `word${wc !== 1 ? 's' : ''} selected`;
+    selWordsPill.classList.remove('active');
+    void selWordsPill.offsetWidth;
+    selWordsPill.classList.add('active');
+    lastSelWords = wc;
+  }
+  if (cc !== lastSelChars) {
+    selCharsEl.textContent = cc;
+    selCharsLbl.textContent = `char${cc !== 1 ? 's' : ''} selected`;
+    selCharsPill.classList.remove('active');
+    void selCharsPill.offsetWidth;
+    selCharsPill.classList.add('active');
+    lastSelChars = cc;
+  }
+}
+
+document.addEventListener('selectionchange', updateSelectionStats);
+editorContent.addEventListener('keyup', updateSelectionStats);
+editorContent.addEventListener('mouseup', updateSelectionStats);
+editorContent.addEventListener('touchend', () => setTimeout(updateSelectionStats, 60));
+// Clicking back into the editor with no drag should clear a stale selection readout
+editorContent.addEventListener('blur', resetSelectionStats);
 
 function applyStatsVisibility() {
   statsBar.classList.toggle('stats-hidden', !statsVisible);
